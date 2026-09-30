@@ -431,13 +431,29 @@ class AppState extends ChangeNotifier {
     var goalCount = 0;
     for (final g in goals) {
       if (merge && await _db.goalExistsForPlan(g.planId)) continue;
-      await _db.insertGoal(g);
+      // 不带 id 插入，由数据库自增分配，避免与现有数据主键冲突
+      await _db.insertGoal(Goal(
+        planId: g.planId,
+        type: g.type,
+        period: g.period,
+        totalTimes: g.totalTimes,
+        deadlineDate: g.deadlineDate,
+        startDate: g.startDate,
+        unit: g.unit,
+      ));
       goalCount++;
     }
     var recordCount = 0;
     for (final r in records) {
-      // 同计划同日期只保留一条，合并时自动去重
-      if (await _db.insertRecordIfAbsent(r) != null) recordCount++;
+      // 同计划同日期只保留一条，合并时自动去重；id 由自增分配
+      final fresh = Record(
+        planId: r.planId,
+        date: r.date,
+        note: r.note,
+        count: r.count,
+        createdAt: r.createdAt,
+      );
+      if (await _db.insertRecordIfAbsent(fresh) != null) recordCount++;
     }
     await reload();
     return '计划 $planCount 个、目标 $goalCount 个、记录 $recordCount 条';
