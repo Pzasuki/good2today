@@ -228,32 +228,131 @@ class AppState extends ChangeNotifier {
       .where((r) => r.planId == planId)
       .fold(0, (sum, r) => sum + r.count);
 
-  // 目标已完成数量：按天计 = 有记录的天数；按次计 = 打卡次数累计
-  int goalDoneCount(Plan plan, Goal goal) {
-    final byDay = goal.effectiveUnit == GoalUnit.day;
-    if (goal.type == GoalType.frequency) {
-      final now = DateTime.now();
-      final range =
-          DateUtils.periodRange(goal.period ?? GoalPeriod.month, now);
-      final startKey = DateUtils.toKey(range.$1);
-      final endKey = DateUtils.toKey(range.$2);
-      if (byDay) {
-        // 按天计：统计区间内有记录的天数（一天打多次也算一天）
-        return _records
-            .where((r) =>
-                r.planId == plan.id &&
-                r.date.compareTo(startKey) >= 0 &&
-                r.date.compareTo(endKey) <= 0)
-            .map((r) => r.date)
-            .toSet()
-            .length;
-      }
-      return countInRange(plan, range.$1, range.$2);
+  // 目标在某周期内的实际完成数量（anchor 为该周期内任意一天）
+  // 按天计 = 区间内有记录的天数；按次计 = 打卡次数累计
+  int goalDoneInPeriod(Plan plan, Goal goal, DateTime anchor) {
+    final range =
+        DateUtils.periodRange(goal.period ?? GoalPeriod.month, anchor);
+    if (goal.effectiveUnit == GoalUnit.day) {
+      return daysInRange(plan, range.$1, range.$2);
     }
-    // 总量目标
-    return byDay
-        ? recordDatesOf(plan.id!).length
-        : totalCount(plan.id!);
+    return countInRange(plan, range.$1, range.$2);
+  }
+
+  // 目标在当前周期的实际完成数量
+  int goalDoneCount(Plan plan, Goal goal) {
+    // 总量目标：按天计 = 全部有记录天数；按次计 = 总次数
+    if (goal.type == GoalType.total) {
+      return goal.effectiveUnit == GoalUnit.day
+          ? recordDatesOf(plan.id!).length
+          : totalCount(plan.id!);
+    }
+    return goalDoneInPeriod(plan, goal, DateTime.now());
+  }
+
+  // 周期起始日（anchor 所在周期的第一天）
+  DateTime _periodStart(String period, DateTime anchor) {
+    switch (period) {
+      case GoalPeriod.week:
+        return DateUtils.dateOnly(
+            DateUtils.addDays(anchor, -(anchor.weekday - 1)));
+      case GoalPeriod.year:
+        return DateTime(anchor.year, 1, 1);
+      default:
+        return DateTime(anchor.year, anchor.month, 1);
+    }
+  }
+
+  // 下一个周期的起始日
+  DateTime _nextPeriodStart(String period, DateTime anchor) {
+    final start = _periodStart(period, anchor);
+    switch (period) {
+      case GoalPeriod.week:
+        return DateUtils.addDays(start, 7);
+      case GoalPeriod.year:
+        return DateTime(start.year + 1, 1, 1);
+      default:
+        return DateTime(start.year, start.month + 1, 1);
+    }
+  }
+
+  // 上一个周期的起始日
+  DateTime _previousPeriodStart(String period, DateTime anchor) {
+    final start = _periodStart(period, anchor);
+    return _periodStart(period, DateUtils.addDays(start, -1));
+  }
+
+  // 连续达成目标的周期数；当前周期未达标不视为中断
+  int goalStreak(Plan plan, Goal goal) {
+    if (goal.totalTimes <= 0) return 0;
+    final period = goal.period ?? GoalPeriod.month;
+    final now = DateUtils.dateOnly(DateTime.now());
+    var count = 0;
+    var anchor = _periodStart(period, now);
+    // 当前周期（进行中）已达标才计入
+    if (goalDoneInPeriod(plan, goal, anchor) >= goal.totalTimes) {
+      count++;
+    }
+    // 从上一个完整周期往回数，遇到未达标即停
+    anchor = _previousPeriodStart(period, anchor);
+    while (goalDoneInPeriod(plan, goal, anchor) >= goal.totalTimes) {
+      count++;
+      anchor = _previousPeriodStart(period, anchor);
+      if (anchor.isBefore(DateTime(2000, 1, 1))) break; // 防御
+    }
+    return count;
+  }
+
+  // 历史上最长的连续达标周期数
+  int bestGoalStreak(Plan plan, Goal goal) {
+    if (goal.totalTimes <= 0) return 0;
+    final period = goal.period ?? GoalPeriod.month;
+    final dates = recordDatesOf(plan.id!).toList()..sort();
+    if (dates.isEmpty) return 0;
+    var anchor = _periodStart(period, DateUtils.parse(dates.first));
+    final now = DateUtils.dateOnly(DateTime.now());
+    var cur = 0;
+    var best = 0;
+    while (!anchor.isAfter(now)) {
+      if (goalDoneInPeriod(plan, goal, anchor) >= goal.totalTimes) {
+        cur++;
+        if (cur > best) best = cur;
+      } else {
+        cur = 0;
+      }
+      anchor = _nextPeriodStart(period, anchor);
+    }
+    return best;
+  }
+
+  // 目标最近 count 个周期的完成情况（从新到旧，返回周期起始日与完成数）
+  List<(DateTime, int)> goalPeriodHistory(Plan plan, Goal goal,
+      {int count = 12}) {
+    final period = goal.period ?? GoalPeriod.month;
+    var anchor = _periodStart(period, DateUtils.dateOnly(DateTime.now()));
+    final out = <(DateTime, int)>[];
+    for (var i = 0; i < count; i++) {
+      out.add((anchor, goalDoneInPeriod(plan, goal, anchor)));
+      anchor = _previousPeriodStart(period, anchor);
+    }
+    return out;
+  }
+
+  // 从最早记录所在周期到当前周期的周期总数
+  int goalPeriodCount(Plan plan, Goal goal) {
+    final period = goal.period ?? GoalPeriod.month;
+    final dates = recordDatesOf(plan.id!).toList()..sort();
+    if (dates.isEmpty) return 1;
+    final start = _periodStart(period, DateUtils.parse(dates.first));
+    final current = _periodStart(period, DateUtils.dateOnly(DateTime.now()));
+    var count = 1;
+    var cursor = start;
+    while (cursor.isBefore(current)) {
+      cursor = _nextPeriodStart(period, cursor);
+      count++;
+      if (count > 1200) break; // 防御
+    }
+    return count;
   }
 
   // 目标的展示文案，如 "本月 3/12 天"；无目标返回 null
@@ -304,72 +403,18 @@ class AppState extends ChangeNotifier {
     return c;
   }
 
-  // 本周（周一到今天）完成率：应打卡 vs 已打卡
-  double weekCompletionRate() {
-    final now = DateTime.now();
-    final monday = DateUtils.addDays(now, -(now.weekday - 1));
-    return _periodCompletionRate(monday, now);
-  }
-
-  // 本月（1号到今天）完成率
-  double monthCompletionRate() {
-    final now = DateTime.now();
-    final first = DateTime(now.year, now.month, 1);
-    return _periodCompletionRate(first, now);
-  }
-
-  // 计算某区间完成率：所有有效计划的应打卡天数合计为分母
-  double _periodCompletionRate(DateTime start, DateTime end) {
-    var expected = 0;
-    var done = 0;
-    for (final plan in _plans) {
-      // 不固定打卡的计划没有"应打卡日"，不计入完成率分母
-      if (plan.repeatType == RepeatType.flex) continue;
-      for (var d = DateUtils.dateOnly(start);
-          !d.isAfter(DateUtils.dateOnly(end));
-          d = DateUtils.addDays(d, 1)) {
-        if (plan.shouldCheckIn(d)) {
-          expected++;
-          if (hasRecord(plan.id!, DateUtils.toKey(d))) done++;
-        }
-      }
-    }
-    if (expected == 0) return 0;
-    return done / expected;
-  }
-
-  // 某计划历史上最长的连续打卡天数
-  int maxStreakOf(Plan plan) {
-    final dates = recordDatesOf(plan.id!).toList()..sort();
-    if (dates.isEmpty) return 0;
-    var best = 0;
-    var cur = 0;
-    // 从第一次打卡那天逐天走到今天：
-    // 应打卡且打了 → 连续 +1；应打卡却没打 → 连续清零；非打卡日不影响
-    var day = DateUtils.parse(dates.first);
-    final today = DateUtils.dateOnly(DateTime.now());
-    while (!day.isAfter(today)) {
-      if (plan.shouldCheckIn(day)) {
-        if (hasRecord(plan.id!, DateUtils.toKey(day))) {
-          cur++;
-          if (cur > best) best = cur;
-        } else {
-          cur = 0;
-        }
-      }
-      day = DateUtils.addDays(day, 1);
-    }
-    return best;
-  }
-
-  // 所有计划中的历史最长连续天数
-  int maxStreak() {
-    var best = 0;
-    for (final plan in _plans) {
-      final s = maxStreakOf(plan);
-      if (s > best) best = s;
-    }
-    return best;
+  // 某计划在区间内的打卡天数（一天多次也算一天）
+  int daysInRange(Plan plan, DateTime start, DateTime end) {
+    final startKey = DateUtils.toKey(start);
+    final endKey = DateUtils.toKey(end);
+    return _records
+        .where((r) =>
+            r.planId == plan.id &&
+            r.date.compareTo(startKey) >= 0 &&
+            r.date.compareTo(endKey) <= 0)
+        .map((r) => r.date)
+        .toSet()
+        .length;
   }
 
   // ============ 导入 / 导出 ============

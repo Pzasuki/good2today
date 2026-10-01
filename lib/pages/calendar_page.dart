@@ -2,13 +2,15 @@
 // 点某天 → 下方列出该天相关计划；点行打卡/取消（过去的日子即补打卡）；
 // 点备注图标写备注。
 
+import 'dart:math' as math;
+
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart' hide DateUtils;
 import 'package:provider/provider.dart';
 import 'package:table_calendar/table_calendar.dart';
 
 import '../db/app_state.dart';
 import '../models/plan.dart';
-import '../models/record.dart';
 import '../utils/date_utils.dart';
 import '../utils/icon_map.dart';
 
@@ -60,8 +62,8 @@ class _CalendarPageState extends State<CalendarPage> {
       ),
       body: Column(
         children: [
-          // 月历：有打卡的日期在数字下方显示彩色圆点（颜色随计划）
-          TableCalendar<Record>(
+          // 月历：有打卡的日子用计划颜色饼图填充整个圆形
+          TableCalendar(
             firstDay: DateTime(2020, 1, 1),
             lastDay: DateTime(2100, 12, 31),
             focusedDay: _focusedDay,
@@ -73,35 +75,14 @@ class _CalendarPageState extends State<CalendarPage> {
               _focusedDay = focused;
             }),
             onPageChanged: (focused) => _focusedDay = focused,
-            // 每天的打卡记录，供圆点标记使用
-            eventLoader: (day) => appState.recordsOn(DateUtils.toKey(day)),
             headerStyle: const HeaderStyle(
               formatButtonVisible: false,
               titleCentered: true,
             ),
             calendarStyle: const CalendarStyle(outsideDaysVisible: false),
             calendarBuilders: CalendarBuilders(
-              markerBuilder: (context, day, events) {
-                if (events.isEmpty) return null;
-                // 每条记录一个色点，最多显示 4 个
-                return Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    for (final r in events.take(4))
-                      Container(
-                        width: 6,
-                        height: 6,
-                        margin: const EdgeInsets.symmetric(horizontal: 1),
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: Color(appState
-                                  .planById(r.planId)?.color ??
-                              0xFF9E9E9E),
-                        ),
-                      ),
-                  ],
-                );
-              },
+              defaultBuilder: (context, day, focusedDay) =>
+                  _dayCell(context, appState, day, focusedDay),
             ),
           ),
           const Divider(height: 1),
@@ -134,7 +115,7 @@ class _CalendarPageState extends State<CalendarPage> {
                     ),
                   )
                 : ListView.builder(
-                    padding: const EdgeInsets.only(bottom: 16),
+                    padding: const EdgeInsets.only(bottom: 100),
                     itemCount: dayPlans.length,
                     itemBuilder: (context, i) {
                       final plan = dayPlans[i];
@@ -250,6 +231,116 @@ class _CalendarPageState extends State<CalendarPage> {
     if (!mounted) return;
     await appState.setNote(plan.id!, dateKey, note);
   }
+
+  // 单个日期格子：有打卡 → 计划颜色饼图填充圆形；无打卡 → 默认样式
+  Widget _dayCell(BuildContext context, AppState appState, DateTime day,
+      DateTime focusedDay) {
+    final scheme = Theme.of(context).colorScheme;
+    final isSelected = isSameDay(_selectedDay, day);
+    final isToday = isSameDay(DateTime.now(), day);
+
+    // 当天打卡的计划颜色（同一计划多次去重，多计划平分圆）
+    final colors = <Color>[];
+    for (final r in appState.recordsOn(DateUtils.toKey(day))) {
+      final p = appState.planById(r.planId);
+      final c = p == null ? const Color(0xFF9E9E9E) : Color(p.color);
+      if (!colors.contains(c)) colors.add(c);
+    }
+    final hasRecords = colors.isNotEmpty;
+
+    // 数字颜色：饼图上用白色；选中/今天用主色
+    final textColor = hasRecords
+        ? Colors.white
+        : isSelected
+            ? scheme.onPrimary
+            : isToday
+                ? scheme.primary
+                : null;
+
+    return Center(
+      child: SizedBox(
+        width: 42,
+        height: 42,
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            // 选中/今天的外圈
+            if (isSelected)
+              Container(
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  border: Border.all(color: scheme.primary, width: 2),
+                ),
+              )
+            else if (isToday)
+              Container(
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  border:
+                      Border.all(color: scheme.primary, width: 1.2),
+                ),
+              ),
+            // 填充层：颜色饼图 / 选中的实心圆
+            if (hasRecords)
+              SizedBox(
+                width: 36,
+                height: 36,
+                child: CustomPaint(painter: _PiePainter(colors)),
+              )
+            else if (isSelected)
+              Container(
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: scheme.primary,
+                ),
+              ),
+            Text(
+              '${day.day}',
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: hasRecords || isToday
+                    ? FontWeight.bold
+                    : FontWeight.w500,
+                color: textColor,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// 日期格子的颜色饼图：多个计划时把圆形平分成几瓣
+class _PiePainter extends CustomPainter {
+  _PiePainter(this.colors);
+
+  final List<Color> colors;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (colors.isEmpty) return;
+    final rect = Offset.zero & size;
+    final paint = Paint()..style = PaintingStyle.fill;
+    // 单个颜色直接画整圆
+    if (colors.length == 1) {
+      paint.color = colors.first;
+      canvas.drawCircle(rect.center, size.width / 2, paint);
+      return;
+    }
+    // 多个颜色：从正上方开始平分扇形
+    final sweep = 2 * math.pi / colors.length;
+    var start = -math.pi / 2;
+    for (final c in colors) {
+      paint.color = c;
+      canvas.drawArc(rect, start, sweep, true, paint);
+      start += sweep;
+    }
+  }
+
+  @override
+  bool shouldRepaint(_PiePainter oldDelegate) =>
+      !listEquals(oldDelegate.colors, colors);
 }
 
 // 备注输入对话框：控制器由本组件自己管理，随组件销毁释放

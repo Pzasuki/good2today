@@ -45,7 +45,8 @@ class TodayPage extends StatelessWidget {
         ],
       ),
       body: ListView(
-        padding: const EdgeInsets.all(16),
+        // 底部留白避开浮动玻璃导航栏
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 100),
         children: [
           // 顶部：日期 + 完成率
           _Header(today: today, doneCount: doneCount, totalCount: totalCount),
@@ -59,13 +60,16 @@ class TodayPage extends StatelessWidget {
                 )),
         ],
       ),
-      // 添加计划入口：跳转到完整的计划编辑页
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => Navigator.of(context).push(
-          MaterialPageRoute(builder: (_) => const PlanEditPage()),
+      // 添加计划入口：跳转到完整的计划编辑页（垫高避开玻璃导航栏）
+      floatingActionButton: Padding(
+        padding: const EdgeInsets.only(bottom: 88),
+        child: FloatingActionButton.extended(
+          onPressed: () => Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const PlanEditPage()),
+          ),
+          icon: const Icon(Icons.add),
+          label: const Text('添加计划'),
         ),
-        icon: const Icon(Icons.add),
-        label: const Text('添加计划'),
       ),
     );
   }

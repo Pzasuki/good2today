@@ -1,13 +1,16 @@
 // 统计页：本周/本月完成率、最长连续打卡、累计打卡次数，
 // 以及各计划完成次数对比柱状图（fl_chart）。
+// 点击指标卡进入对应详情页。
 
 import 'package:flutter/material.dart' hide DateUtils;
 import 'package:fl_chart/fl_chart.dart';
 import 'package:provider/provider.dart';
 
 import '../db/app_state.dart';
+import '../models/goal.dart';
 import '../models/plan.dart';
 import '../utils/date_utils.dart';
+import 'stats_detail_pages.dart';
 
 class StatsPage extends StatefulWidget {
   const StatsPage({super.key});
@@ -20,6 +23,11 @@ class _StatsPageState extends State<StatsPage> {
   // 对比图的统计周期：'week' / 'month'
   String _period = 'week';
 
+  // 跳转到详情页
+  void _open(BuildContext context, Widget page) {
+    Navigator.of(context).push(MaterialPageRoute(builder: (_) => page));
+  }
+
   @override
   Widget build(BuildContext context) {
     final appState = context.watch<AppState>();
@@ -27,10 +35,34 @@ class _StatsPageState extends State<StatsPage> {
     final now = DateUtils.dateOnly(DateTime.now());
 
     // 各项指标
-    final weekRate = appState.weekCompletionRate();
-    final monthRate = appState.monthCompletionRate();
-    final bestStreak = appState.maxStreak();
-    final totalCheckIns = appState.records.length;
+    final totalCheckIns =
+        appState.records.fold<int>(0, (s, r) => s + r.count);
+
+    // 有周期目标的计划（用于"本月目标"与"达标连续"）
+    final goalPlans = <(Plan, Goal)>[];
+    for (final p in plans) {
+      final g = appState.goalOf(p.id!);
+      if (g != null && g.type == GoalType.frequency) {
+        goalPlans.add((p, g));
+      }
+    }
+    // 本月（当前周期）已达标的目标数
+    final metCount = goalPlans
+        .where((e) =>
+            appState.goalDoneCount(e.$1, e.$2) >= e.$2.totalTimes)
+        .length;
+    // 最长的达标连续周期数
+    final bestGoalStreak = goalPlans.fold<int>(0, (m, e) {
+      final s = appState.goalStreak(e.$1, e.$2);
+      return s > m ? s : m;
+    });
+    final periodWord = goalPlans.isEmpty
+        ? ''
+        : switch (goalPlans.first.$2.period) {
+            GoalPeriod.week => '周',
+            GoalPeriod.year => '年',
+            _ => '个月',
+          };
 
     // 选中周期内各计划的打卡次数
     final range = DateUtils.periodRange(_period, now);
@@ -41,40 +73,43 @@ class _StatsPageState extends State<StatsPage> {
     return Scaffold(
       appBar: AppBar(title: const Text('统计'), centerTitle: true),
       body: ListView(
-        padding: const EdgeInsets.all(16),
+        // 底部留白避开浮动玻璃导航栏
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 100),
         children: [
-          // 完成率指标卡
-          Row(
-            children: [
-              Expanded(
-                child: _StatTile(
-                  label: '本周完成率',
-                  value: '${(weekRate * 100).round()}%',
-                  progress: weekRate,
+          // 本月目标 + 达标连续（点击查看历史；IntrinsicHeight 保证两卡等高）
+          IntrinsicHeight(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(
+                  child: _StatTile(
+                    label: '本月目标',
+                    value: goalPlans.isEmpty
+                        ? '未设置'
+                        : '$metCount/${goalPlans.length} 项达标',
+                    progress: goalPlans.isEmpty
+                        ? null
+                        : metCount / goalPlans.length,
+                    onTap: () => _open(context, const GoalHistoryPage()),
+                  ),
                 ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: _StatTile(
-                  label: '本月完成率',
-                  value: '${(monthRate * 100).round()}%',
-                  progress: monthRate,
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _StatTile(
+                    label: '达标连续',
+                    value: '$bestGoalStreak$periodWord',
+                    onTap: () => _open(context, const StreakDetailPage()),
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
           const SizedBox(height: 12),
-          // 连续天数 / 累计次数
-          Row(
-            children: [
-              Expanded(
-                child: _StatTile(label: '最长连续打卡', value: '$bestStreak 天'),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: _StatTile(label: '累计打卡', value: '$totalCheckIns 次'),
-              ),
-            ],
+          // 累计打卡（点击查看历史数据，可按计划筛选）
+          _StatTile(
+            label: '累计打卡',
+            value: '$totalCheckIns 次',
+            onTap: () => _open(context, const TotalStatsPage()),
           ),
           const SizedBox(height: 16),
           // 对比图标题 + 周期切换
@@ -118,8 +153,8 @@ class _StatsPageState extends State<StatsPage> {
   }
 
   // 各计划完成次数对比柱状图；柱子颜色随计划颜色
-  Widget _buildBarChart(BuildContext context, List<Plan> plans,
-      List<int> counts) {
+  Widget _buildBarChart(
+      BuildContext context, List<Plan> plans, List<int> counts) {
     final maxCount = counts.fold(0, (a, b) => a > b ? a : b);
     final maxY = (maxCount <= 3 ? 4 : maxCount + 1).toDouble();
     // 纵轴刻度间隔：数量少时按 1 递增，多时按 1/4 量程取整
@@ -201,13 +236,19 @@ class _StatsPageState extends State<StatsPage> {
   }
 }
 
-// 指标卡：标签 + 大数字，可选进度条
+// 指标卡：标签 + 大数字，可选进度条；可点击进入详情
 class _StatTile extends StatelessWidget {
-  const _StatTile({required this.label, required this.value, this.progress});
+  const _StatTile({
+    required this.label,
+    required this.value,
+    this.progress,
+    this.onTap,
+  });
 
   final String label;
   final String value;
   final double? progress;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -216,29 +257,43 @@ class _StatTile extends StatelessWidget {
       elevation: 0,
       color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(label, style: theme.textTheme.bodySmall),
-            const SizedBox(height: 6),
-            Text(
-              value,
-              style: theme.textTheme.headlineSmall
-                  ?.copyWith(fontWeight: FontWeight.bold),
-            ),
-            if (progress != null) ...[
-              const SizedBox(height: 8),
-              ClipRRect(
-                borderRadius: BorderRadius.circular(4),
-                child: LinearProgressIndicator(
-                  value: progress!.clamp(0.0, 1.0),
-                  minHeight: 6,
-                ),
+      margin: EdgeInsets.zero,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(label, style: theme.textTheme.bodySmall),
+                  ),
+                  // 可点击的卡片右上角显示小箭头
+                  Icon(Icons.chevron_right,
+                      size: 16, color: theme.colorScheme.outline),
+                ],
               ),
+              const SizedBox(height: 6),
+              Text(
+                value,
+                style: theme.textTheme.headlineSmall
+                    ?.copyWith(fontWeight: FontWeight.bold),
+              ),
+              if (progress != null) ...[
+                const SizedBox(height: 8),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(4),
+                  child: LinearProgressIndicator(
+                    value: progress!.clamp(0.0, 1.0),
+                    minHeight: 6,
+                  ),
+                ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
     );

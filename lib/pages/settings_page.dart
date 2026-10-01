@@ -18,7 +18,8 @@ class SettingsPage extends StatelessWidget {
     return Scaffold(
       appBar: AppBar(title: const Text('设置')),
       body: ListView(
-        padding: const EdgeInsets.all(16),
+        // 底部留白避开浮动玻璃导航栏
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 100),
         children: [
           // 主题颜色选择
           Card(
