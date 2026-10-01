@@ -104,3 +104,16 @@ class Goal {
     );
   }
 }
+
+// 聚合展示用的周期单位词（如"连续 3 个月"）。
+// 各计划的周期不一致时用中性的"个周期"，避免拿某一个计划的周期
+// 给所有计划的统计结果配单位。
+String frequencyPeriodWord(Iterable<String?> periods) {
+  final distinct = periods.whereType<String>().toSet();
+  if (distinct.length != 1) return '个周期';
+  return switch (distinct.first) {
+    GoalPeriod.week => '周',
+    GoalPeriod.year => '年',
+    _ => '个月',
+  };
+}

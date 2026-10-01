@@ -56,13 +56,10 @@ class _StatsPageState extends State<StatsPage> {
       final s = appState.goalStreak(e.$1, e.$2);
       return s > m ? s : m;
     });
+    // 周期单位词：各计划周期不一致时用中性说法
     final periodWord = goalPlans.isEmpty
         ? ''
-        : switch (goalPlans.first.$2.period) {
-            GoalPeriod.week => '周',
-            GoalPeriod.year => '年',
-            _ => '个月',
-          };
+        : frequencyPeriodWord(goalPlans.map((e) => e.$2.period));
 
     // 选中周期内各计划的打卡次数
     final range = DateUtils.periodRange(_period, now);

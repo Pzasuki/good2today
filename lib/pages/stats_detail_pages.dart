@@ -202,6 +202,22 @@ class _HistoryBars extends StatefulWidget {
 
 class _HistoryBarsState extends State<_HistoryBars> {
   final ScrollController _controller = ScrollController();
+  bool _scrolledToEnd = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // 首帧布局完成后滚动到最右（最新周期），只执行一次；
+    // 之后数据变化触发的重建不再把用户手动滑动的位置拉回
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _scrolledToEnd) return;
+      _scrolledToEnd = true;
+      if (_controller.hasClients &&
+          _controller.position.maxScrollExtent > 0) {
+        _controller.jumpTo(_controller.position.maxScrollExtent);
+      }
+    });
+  }
 
   @override
   void dispose() {
@@ -212,13 +228,6 @@ class _HistoryBarsState extends State<_HistoryBars> {
   @override
   Widget build(BuildContext context) {
     final outline = Theme.of(context).colorScheme.outline;
-    // 首帧后滚动到最右（最新周期）
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_controller.hasClients &&
-          _controller.position.maxScrollExtent > 0) {
-        _controller.jumpTo(_controller.position.maxScrollExtent);
-      }
-    });
 
     return SizedBox(
       height: 62,
@@ -339,7 +348,7 @@ class StreakDetailPage extends StatelessWidget {
                       Text(
                           items.isEmpty
                               ? '0'
-                              : '$best ${_periodWord(items.first.$2.period)}',
+                              : '$best ${frequencyPeriodWord(items.map((e) => e.$2.period))}',
                           style: theme.textTheme.headlineSmall
                               ?.copyWith(fontWeight: FontWeight.bold)),
                       Text('全部计划中的最长达标连续',
@@ -447,10 +456,12 @@ class _TotalStatsPageState extends State<TotalStatsPage> {
             .firstOrNull;
 
     final totalTimes = filtered.fold<int>(0, (s, r) => s + r.count);
-    final totalDays = filtered.map((r) => r.date).toSet().length;
-    final firstDate = filtered.isEmpty
+    // 打卡天数/开始日期按"已打卡"（count>0）统计，纯备注记录不算
+    final doneRecords = [for (final r in filtered) if (r.count > 0) r];
+    final totalDays = doneRecords.map((r) => r.date).toSet().length;
+    final firstDate = doneRecords.isEmpty
         ? '—'
-        : filtered
+        : doneRecords
             .map((r) => r.date)
             .reduce((a, b) => a.compareTo(b) < 0 ? a : b);
 
@@ -554,8 +565,10 @@ class _TotalStatsPageState extends State<TotalStatsPage> {
       Map<int, Color> colorById) {
     final theme = Theme.of(context);
     final total = byPlan.values.fold(0, (a, b) => a + b);
-    // 按 planId 排序保证颜色顺序稳定
-    final segments = byPlan.entries.toList()
+    // 按 planId 排序保证颜色顺序稳定；0 次分段不画（纯备注/Expanded flex 不接受 0）
+    final segments = byPlan.entries
+        .where((e) => e.value > 0)
+        .toList()
       ..sort((a, b) => a.key.compareTo(b.key));
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),

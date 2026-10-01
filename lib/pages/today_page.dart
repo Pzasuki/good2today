@@ -24,9 +24,9 @@ class TodayPage extends StatelessWidget {
         .where((p) => p.shouldCheckIn(DateTime.now()))
         .toList();
 
-    // 今日完成统计
+    // 今日完成统计（纯备注记录不算完成）
     final doneCount =
-        todayPlans.where((p) => appState.hasRecord(p.id!, today)).length;
+        todayPlans.where((p) => appState.isDone(p.id!, today)).length;
     final totalCount = todayPlans.length;
 
     return Scaffold(

@@ -53,6 +53,7 @@ class _PlanEditPageState extends State<PlanEditPage> {
   String? _deadline; // 总量目标的截止日期
 
   OverlayEntry? _toastEntry; // 当前显示的浮动提示
+  Timer? _toastTimer; // 提示自动消失的定时器
 
   @override
   void initState() {
@@ -86,10 +87,13 @@ class _PlanEditPageState extends State<PlanEditPage> {
 
   @override
   void dispose() {
-    // 页面销毁时统一释放控制器
+    // 页面销毁时统一释放控制器与提示
+    // （取消定时器并置空 entry，避免对已移除的 entry 二次 remove）
     _nameController.dispose();
     _timesController.dispose();
+    _toastTimer?.cancel();
     _toastEntry?.remove();
+    _toastEntry = null;
     super.dispose();
   }
 
@@ -100,6 +104,8 @@ class _PlanEditPageState extends State<PlanEditPage> {
   // 居中浮动提示气泡：无按钮、不阻挡操作，1.5 秒后自动消失
   void _toast(String msg) {
     // 已有提示先移除，避免叠加
+    _toastTimer?.cancel();
+    _toastTimer = null;
     _toastEntry?.remove();
     _toastEntry = null;
 
@@ -133,7 +139,8 @@ class _PlanEditPageState extends State<PlanEditPage> {
     _toastEntry = entry;
     Overlay.of(context).insert(entry);
     // 自动消失
-    Timer(const Duration(milliseconds: 1500), () {
+    _toastTimer = Timer(const Duration(milliseconds: 1500), () {
+      _toastTimer = null;
       if (_toastEntry == entry) {
         entry.remove();
         _toastEntry = null;
@@ -173,10 +180,10 @@ class _PlanEditPageState extends State<PlanEditPage> {
     if (picked != null) setState(() => _color = picked.toARGB32());
   }
 
-  // 根据当前表单状态构造 Goal
-  Goal _buildGoal(int planId, int times) {
+  // 根据当前表单状态构造 Goal；planId 占位为 0，由 savePlanWithGoal 填充
+  Goal _buildGoal(int times) {
     return Goal(
-      planId: planId,
+      planId: 0,
       type: _goalMode == 'frequency' ? GoalType.frequency : GoalType.total,
       period: _goalMode == 'frequency' ? _goalPeriod : null,
       totalTimes: times,
@@ -220,21 +227,9 @@ class _PlanEditPageState extends State<PlanEditPage> {
       createdAt: widget.plan?.createdAt ?? appState.nowStamp(),
     );
 
-    if (widget.plan == null) {
-      // 新增计划
-      final id = await appState.addPlan(plan);
-      if (_goalMode != 'none') {
-        await appState.saveGoal(_buildGoal(id, times));
-      }
-    } else {
-      // 编辑计划；目标改为"无"时删除旧目标
-      await appState.editPlan(plan);
-      if (_goalMode == 'none') {
-        await appState.removeGoal(plan.id!);
-      } else {
-        await appState.saveGoal(_buildGoal(plan.id!, times));
-      }
-    }
+    // 计划与目标一次写库、一次 reload（新增/编辑/清除目标统一处理）
+    await appState.savePlanWithGoal(
+        plan, _goalMode == 'none' ? null : _buildGoal(times));
 
     if (!mounted) return;
     Navigator.of(context).pop();

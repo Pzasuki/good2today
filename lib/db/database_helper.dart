@@ -170,54 +170,118 @@ class DatabaseHelper {
     await db.delete('goal', where: 'id = ?', whereArgs: [id]);
   }
 
-  // ============ 打卡记录 CRUD ============
+  // ============ 打卡记录 ============
 
+  // 加载全部打卡记录
   Future<List<Record>> getRecords() async {
     final db = await database;
     final rows = await db.query('record');
     return rows.map(Record.fromMap).toList();
   }
 
-  // 查询某天的所有打卡记录
-  Future<List<Record>> getRecordsByDate(String date) async {
+  // ---- 单记录原子操作 ----
+  // 打卡是最高频操作：在事务内按 (plan_id, date) 以数据库实际状态为准，
+  // 返回操作后的权威记录，供上层同步内存缓存；连点/并发也不会基于旧状态误判。
+
+  // 普通计划打卡切换：无记录 → 插入 count=1；纯备注记录(count=0) → 置 1；
+  // 已打卡 → 删除。返回操作后的记录（null = 记录已删除）。
+  Future<Record?> toggleRecord(int planId, String date, String createdAt) async {
     final db = await database;
-    final rows = await db.query('record', where: 'date = ?', whereArgs: [date]);
-    return rows.map(Record.fromMap).toList();
+    return db.transaction<Record?>((txn) async {
+      final rows = await txn.query('record',
+          where: 'plan_id = ? AND date = ?', whereArgs: [planId, date], limit: 1);
+      if (rows.isEmpty) {
+        final rec = Record(planId: planId, date: date, count: 1, createdAt: createdAt);
+        final id = await txn.insert('record', rec.toMap());
+        return rec.copyWith(id: id);
+      }
+      final existing = Record.fromMap(rows.first);
+      if (existing.count <= 0) {
+        // 纯备注记录：打卡 = 计为 1，保留备注
+        final updated = existing.copyWith(count: 1);
+        await txn.update('record', updated.toMap(),
+            where: 'id = ?', whereArgs: [existing.id]);
+        return updated;
+      }
+      await txn.delete('record', where: 'id = ?', whereArgs: [existing.id]);
+      return null;
+    });
   }
 
-  // 查询某计划的所有打卡记录
-  Future<List<Record>> getRecordsByPlan(int planId) async {
+  // 每天可多次的计划：次数 +1（无记录则插入 count=1）。返回最新记录。
+  Future<Record> incrementRecord(int planId, String date, String createdAt) async {
     final db = await database;
-    final rows = await db.query('record', where: 'plan_id = ?', whereArgs: [planId]);
-    return rows.map(Record.fromMap).toList();
+    return db.transaction<Record>((txn) async {
+      final changed = await txn.rawUpdate(
+          'UPDATE record SET count = count + 1 WHERE plan_id = ? AND date = ?',
+          [planId, date]);
+      if (changed == 0) {
+        await txn.insert('record', {
+          'plan_id': planId,
+          'date': date,
+          'count': 1,
+          'created_at': createdAt,
+        });
+      }
+      final rows = await txn.query('record',
+          where: 'plan_id = ? AND date = ?', whereArgs: [planId, date], limit: 1);
+      return Record.fromMap(rows.first);
+    });
   }
 
-  // 查询某个计划某天是否有记录
-  Future<Record?> getRecord(int planId, String date) async {
+  // 次数 -1：>1 自减；=1 时有备注退成纯备注记录（count=0），无备注删除。
+  // 返回操作后的记录（null = 记录已删除）。
+  Future<Record?> decrementRecord(int planId, String date) async {
     final db = await database;
-    final rows = await db.query('record',
-        where: 'plan_id = ? AND date = ?', whereArgs: [planId, date], limit: 1);
-    if (rows.isEmpty) return null;
-    return Record.fromMap(rows.first);
+    return db.transaction<Record?>((txn) async {
+      final rows = await txn.query('record',
+          where: 'plan_id = ? AND date = ?', whereArgs: [planId, date], limit: 1);
+      if (rows.isEmpty) return null;
+      final existing = Record.fromMap(rows.first);
+      if (existing.count > 1) {
+        final updated = existing.copyWith(count: existing.count - 1);
+        await txn.update('record', updated.toMap(),
+            where: 'id = ?', whereArgs: [existing.id]);
+        return updated;
+      }
+      if ((existing.note ?? '').isNotEmpty) {
+        // 保留备注，退成"纯备注"记录
+        final updated = existing.copyWith(count: 0);
+        await txn.update('record', updated.toMap(),
+            where: 'id = ?', whereArgs: [existing.id]);
+        return updated;
+      }
+      await txn.delete('record', where: 'id = ?', whereArgs: [existing.id]);
+      return null;
+    });
   }
 
-  // 新增打卡记录
-  Future<int> insertRecord(Record record) async {
+  // 设置备注：无记录且备注非空 → 插入纯备注记录（count=0，不计入打卡）；
+  // 备注清空且未打卡 → 记录失去意义，删除。返回操作后的记录（null = 无记录）。
+  Future<Record?> setNoteRecord(
+      int planId, String date, String note, String createdAt) async {
     final db = await database;
-    return db.insert('record', record.toMap(),
-        conflictAlgorithm: ConflictAlgorithm.replace);
-  }
-
-  // 更新记录（如修改备注）
-  Future<void> updateRecord(Record record) async {
-    final db = await database;
-    await db.update('record', record.toMap(), where: 'id = ?', whereArgs: [record.id]);
-  }
-
-  // 删除打卡记录
-  Future<void> deleteRecord(int id) async {
-    final db = await database;
-    await db.delete('record', where: 'id = ?', whereArgs: [id]);
+    return db.transaction<Record?>((txn) async {
+      final rows = await txn.query('record',
+          where: 'plan_id = ? AND date = ?', whereArgs: [planId, date], limit: 1);
+      if (rows.isEmpty) {
+        if (note.isEmpty) return null;
+        final rec = Record(
+            planId: planId, date: date, note: note, count: 0, createdAt: createdAt);
+        final id = await txn.insert('record', rec.toMap());
+        return rec.copyWith(id: id);
+      }
+      final existing = Record.fromMap(rows.first);
+      if (note.isEmpty && existing.count <= 0) {
+        // 未打卡且备注清空
+        await txn.delete('record', where: 'id = ?', whereArgs: [existing.id]);
+        return null;
+      }
+      final updated = existing.copyWith(note: note);
+      await txn.update('record', updated.toMap(),
+          where: 'id = ?', whereArgs: [existing.id]);
+      return updated;
+    });
   }
 
   // ============ 导入 / 导出支持 ============
@@ -229,35 +293,92 @@ class DatabaseHelper {
     return rows.map(Plan.fromMap).toList();
   }
 
-  // 清空所有表（覆盖导入前调用）
-  Future<void> clearAll() async {
+  // 整体导入：单一事务内完成清空（覆盖模式）与全部插入，保证原子性——
+  // 中途失败会整体回滚，不会留下半份数据。
+  // merge=true 时已存在的计划/目标跳过，记录按 (plan_id, date) 去重；
+  // planId 指向不存在计划的孤儿数据一律跳过。
+  // 返回 (计划数, 目标数, 记录数, 跳过的孤儿数据条数)。
+  Future<(int, int, int, int)> importAll({
+    required List<Plan> plans,
+    required List<Goal> goals,
+    required List<Record> records,
+    required bool merge,
+  }) async {
     final db = await database;
-    await db.delete('record');
-    await db.delete('goal');
-    await db.delete('plan');
-  }
+    return db.transaction<(int, int, int, int)>((txn) async {
+      if (!merge) {
+        await txn.delete('record');
+        await txn.delete('goal');
+        await txn.delete('plan');
+      }
 
-  // 某计划是否已存在（合并导入去重用）
-  Future<bool> planExists(int id) async {
-    final db = await database;
-    final rows =
-        await db.query('plan', where: 'id = ?', whereArgs: [id], limit: 1);
-    return rows.isNotEmpty;
-  }
+      var planCount = 0;
+      for (final p in plans) {
+        if (p.id == null) continue;
+        // 已存在（库中已有，或备份内重复 id）则跳过
+        final rows = await txn.query('plan',
+            where: 'id = ?', whereArgs: [p.id], limit: 1);
+        if (rows.isNotEmpty) continue;
+        await txn.insert('plan', p.toMap());
+        planCount++;
+      }
 
-  // 某计划是否已有目标
-  Future<bool> goalExistsForPlan(int planId) async {
-    final db = await database;
-    final rows = await db
-        .query('goal', where: 'plan_id = ?', whereArgs: [planId], limit: 1);
-    return rows.isNotEmpty;
-  }
+      // 目标/记录必须挂在真实存在的计划上（含已归档计划）
+      final validPlanIds = {
+        for (final row in await txn.query('plan', columns: ['id']))
+          row['id'] as int,
+      };
 
-  // 插入打卡记录；若同计划同日期已存在则跳过，返回新 id 或 null
-  Future<int?> insertRecordIfAbsent(Record record) async {
-    final db = await database;
-    return db.insert('record', record.toMap(),
-        conflictAlgorithm: ConflictAlgorithm.ignore);
+      var goalCount = 0;
+      var orphanGoals = 0;
+      for (final g in goals) {
+        if (!validPlanIds.contains(g.planId)) {
+          orphanGoals++;
+          continue;
+        }
+        // 同一计划只保留一个目标；不带 id 插入，由数据库自增分配
+        final rows = await txn.query('goal',
+            where: 'plan_id = ?', whereArgs: [g.planId], limit: 1);
+        if (rows.isNotEmpty) continue;
+        await txn.insert(
+            'goal',
+            Goal(
+              planId: g.planId,
+              type: g.type,
+              period: g.period,
+              totalTimes: g.totalTimes,
+              deadlineDate: g.deadlineDate,
+              startDate: g.startDate,
+              unit: g.unit,
+            ).toMap());
+        goalCount++;
+      }
+
+      var recordCount = 0;
+      var orphanRecords = 0;
+      for (final r in records) {
+        if (!validPlanIds.contains(r.planId)) {
+          orphanRecords++;
+          continue;
+        }
+        // 同计划同日期只保留一条；事务内先查再插，判定可靠。
+        // 不带 id 插入，由数据库自增分配
+        final existing = await txn.query('record',
+            where: 'plan_id = ? AND date = ?',
+            whereArgs: [r.planId, r.date],
+            limit: 1);
+        if (existing.isNotEmpty) continue;
+        await txn.insert('record', Record(
+          planId: r.planId,
+          date: r.date,
+          note: r.note,
+          count: r.count,
+          createdAt: r.createdAt,
+        ).toMap());
+        recordCount++;
+      }
+      return (planCount, goalCount, recordCount, orphanGoals + orphanRecords);
+    });
   }
 
   // 读取设置项（无则返回 null）

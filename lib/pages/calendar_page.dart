@@ -39,7 +39,7 @@ class _CalendarPageState extends State<CalendarPage> {
             p.shouldCheckIn(selected) || appState.hasRecord(p.id!, selKey))
         .toList();
     final doneCount =
-        dayPlans.where((p) => appState.hasRecord(p.id!, selKey)).length;
+        dayPlans.where((p) => appState.isDone(p.id!, selKey)).length;
 
     return Scaffold(
       appBar: AppBar(
@@ -74,7 +74,8 @@ class _CalendarPageState extends State<CalendarPage> {
               _selectedDay = sel;
               _focusedDay = focused;
             }),
-            onPageChanged: (focused) => _focusedDay = focused,
+            onPageChanged: (focused) =>
+                setState(() => _focusedDay = focused),
             headerStyle: const HeaderStyle(
               formatButtonVisible: false,
               titleCentered: true,
@@ -239,9 +240,11 @@ class _CalendarPageState extends State<CalendarPage> {
     final isSelected = isSameDay(_selectedDay, day);
     final isToday = isSameDay(DateTime.now(), day);
 
-    // 当天打卡的计划颜色（同一计划多次去重，多计划平分圆）
+    // 当天打卡（count>0）的计划颜色（同一计划多次去重，多计划平分圆；
+    // 纯备注记录不算打卡，不上色）
     final colors = <Color>[];
     for (final r in appState.recordsOn(DateUtils.toKey(day))) {
+      if (r.count <= 0) continue;
       final p = appState.planById(r.planId);
       final c = p == null ? const Color(0xFF9E9E9E) : Color(p.color);
       if (!colors.contains(c)) colors.add(c);

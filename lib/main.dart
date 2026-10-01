@@ -6,10 +6,28 @@ import 'package:provider/provider.dart';
 
 import 'db/app_state.dart';
 import 'pages/home_shell.dart';
+import 'utils/app_themes.dart';
 
-void main() {
-  // 加载中文日期符号，供日历标题/星期以中文显示
-  initializeDateFormatting('zh_CN');
+// 主题缓存：按 (主题key, 亮度) 缓存 ThemeData。
+// ColorScheme.fromSeed 计算量不小，缓存后打卡等数据变化
+// 不会反复触发 MaterialApp 重建整套配色。
+final Map<(String, Brightness), ThemeData> _themeCache = {};
+
+ThemeData _themeFor(String key, Brightness brightness) {
+  return _themeCache.putIfAbsent((key, brightness), () {
+    return ThemeData(
+      colorScheme: ColorScheme.fromSeed(
+        seedColor: themeByKey(key).seed,
+        brightness: brightness,
+      ),
+    );
+  });
+}
+
+Future<void> main() async {
+  // 加载中文日期符号，供日历标题/星期以中文显示。
+  // 等加载完成再启动 UI，避免 TableCalendar 用 zh_CN 格式化时符号尚未就绪
+  await initializeDateFormatting('zh_CN');
   runApp(
     // ChangeNotifierProvider 向全 App 提供 AppState
     ChangeNotifierProvider(
@@ -24,26 +42,15 @@ class DailyLogApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // 监听 AppState：切换主题颜色时重建 MaterialApp
-    return Consumer<AppState>(
-      builder: (context, appState, _) {
-        // Material 3 动态取色：根据所选主题种子色生成整套配色
-        return MaterialApp(
-          title: '打卡记录',
-          debugShowCheckedModeBanner: false,
-          theme: ThemeData(
-            colorScheme: ColorScheme.fromSeed(seedColor: appState.themeSeed),
-          ),
-          darkTheme: ThemeData(
-            colorScheme: ColorScheme.fromSeed(
-              seedColor: appState.themeSeed,
-              brightness: Brightness.dark,
-            ),
-          ),
-          themeMode: ThemeMode.system,
-          home: const HomeShell(),
-        );
-      },
+    // 只监听主题 key：打卡等数据变化不再触发 MaterialApp 重建
+    final themeKey = context.select<AppState, String>((a) => a.themeKey);
+    return MaterialApp(
+      title: '打卡记录',
+      debugShowCheckedModeBanner: false,
+      theme: _themeFor(themeKey, Brightness.light),
+      darkTheme: _themeFor(themeKey, Brightness.dark),
+      themeMode: ThemeMode.system,
+      home: const HomeShell(),
     );
   }
 }

@@ -2,34 +2,40 @@
 // 页面通过 context.watch<AppState>() 读取与调用。
 
 import 'dart:convert';
+import 'dart:collection';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/painting.dart';
 
 import 'database_helper.dart';
 import '../models/plan.dart';
 import '../models/goal.dart';
 import '../models/record.dart';
-import '../utils/app_themes.dart';
 import '../utils/date_utils.dart';
 
 class AppState extends ChangeNotifier {
   final DatabaseHelper _db = DatabaseHelper.instance;
 
-  // 数据缓存
-  List<Plan> _plans = [];
-  List<Goal> _goals = [];
-  List<Record> _records = [];
+  // 数据缓存（就地更新，对外只读）
+  final List<Plan> _plans = [];
+  final List<Goal> _goals = [];
+  final List<Record> _records = [];
 
-  bool _loaded = false;
-  bool get loaded => _loaded;
+  // 只读视图：构造一次常驻，getter 调用零分配；列表就地更新时视图始终同步
+  late final List<Plan> _plansView = UnmodifiableListView(_plans);
+  late final List<Goal> _goalsView = UnmodifiableListView(_goals);
+  late final List<Record> _recordsView = UnmodifiableListView(_records);
+
+  // 派生索引：reload 后重建，单记录操作通过 _syncRecord 增量维护。
+  // 让高频查询（打卡判断、日历格子、连续天数等）从全表扫描降为 O(1)。
+  final Map<int, Plan> _plansById = {}; // planId -> Plan
+  final Map<int, Goal> _goalsByPlan = {}; // planId -> Goal
+  // dateKey -> planId -> Record
+  final Map<String, Map<int, Record>> _recordsByDate = {};
+  final Map<int, List<Record>> _recordsByPlan = {}; // planId -> records
 
   // 当前主题配色 key（持久化在设置表）
   String _themeKey = 'indigo';
   String get themeKey => _themeKey;
-
-  // 当前主题的种子色，MaterialApp 用它生成整套配色
-  Color get themeSeed => themeByKey(_themeKey).seed;
 
   // 切换主题颜色（先更新 UI 再持久化）
   Future<void> setThemeKey(String key) async {
@@ -38,9 +44,9 @@ class AppState extends ChangeNotifier {
     await _db.setSetting('theme_key', key);
   }
 
-  List<Plan> get plans => List.unmodifiable(_plans);
-  List<Goal> get goals => List.unmodifiable(_goals);
-  List<Record> get records => List.unmodifiable(_records);
+  List<Plan> get plans => _plansView;
+  List<Goal> get goals => _goalsView;
+  List<Record> get records => _recordsView;
 
   // 初始化：加载设置与数据
   Future<void> init() async {
@@ -48,28 +54,96 @@ class AppState extends ChangeNotifier {
     await reload();
   }
 
-  // 重新从数据库加载所有数据
+  // 重新从数据库加载所有数据并重建索引。
+  // 列表就地更新（clear + addAll），保证对外只读视图的引用始终有效。
   Future<void> reload() async {
-    _plans = await _db.getPlans();
-    _goals = await _db.getGoals();
-    _records = await _db.getRecords();
-    _loaded = true;
+    // 三张表并行查询
+    final plansFuture = _db.getPlans();
+    final goalsFuture = _db.getGoals();
+    final recordsFuture = _db.getRecords();
+    _plans
+      ..clear()
+      ..addAll(await plansFuture);
+    _goals
+      ..clear()
+      ..addAll(await goalsFuture);
+    _records
+      ..clear()
+      ..addAll(await recordsFuture);
+    _rebuildIndexes();
     notifyListeners();
   }
 
-  // ============ 计划操作 ============
-
-  // 新增计划，返回其 id
-  Future<int> addPlan(Plan plan) async {
-    final id = await _db.insertPlan(plan);
-    await reload();
-    return id;
+  void _rebuildIndexes() {
+    _plansById.clear();
+    for (final p in _plans) {
+      if (p.id != null) _plansById[p.id!] = p;
+    }
+    _goalsByPlan.clear();
+    for (final g in _goals) {
+      _goalsByPlan.putIfAbsent(g.planId, () => g);
+    }
+    _recordsByDate.clear();
+    _recordsByPlan.clear();
+    for (final r in _records) {
+      _recordsByDate.putIfAbsent(r.date, () => {})[r.planId] = r;
+      _recordsByPlan.putIfAbsent(r.planId, () => []).add(r);
+    }
   }
 
-  // 编辑计划
-  Future<void> editPlan(Plan plan) async {
-    await _db.updatePlan(plan);
+  // 用数据库返回的权威状态同步内存缓存（record 为 null 表示该天已无记录）。
+  // 返回是否有实际变化。
+  bool _syncRecord(int planId, String date, Record? record) {
+    final byDate = _recordsByDate.putIfAbsent(date, () => {});
+    final old = byDate[planId];
+    if (record == null) {
+      byDate.remove(planId);
+      if (byDate.isEmpty) _recordsByDate.remove(date);
+      if (old == null) return false;
+      _records.remove(old);
+      _recordsByPlan[planId]?.remove(old);
+      return true;
+    }
+    byDate[planId] = record;
+    if (old != null) {
+      final idx = _records.indexOf(old);
+      if (idx >= 0) _records[idx] = record;
+      final planList = _recordsByPlan[planId];
+      if (planList != null) {
+        final pidx = planList.indexOf(old);
+        if (pidx >= 0) planList[pidx] = record;
+      }
+    } else {
+      _records.add(record);
+      _recordsByPlan.putIfAbsent(planId, () => []).add(record);
+    }
+    return true;
+  }
+
+  // ============ 计划 / 目标操作 ============
+
+  // 保存计划与目标（供编辑页的新增/编辑/清除目标统一使用）：
+  // 一次写库、一次 reload。goal 为 null 表示不设置目标（已有的会被删除）；
+  // goal 的 planId 会被覆盖为实际计划 id（其 id 应为 null，由自增分配）。
+  // 返回计划 id。
+  Future<int> savePlanWithGoal(Plan plan, Goal? goal) async {
+    var planId = plan.id;
+    if (planId == null) {
+      planId = await _db.insertPlan(plan);
+    } else {
+      await _db.updatePlan(plan);
+    }
+    final existing = await _db.getGoalForPlan(planId);
+    if (goal == null) {
+      // 目标改为"无"：删除旧目标
+      if (existing != null) await _db.deleteGoal(existing.id!);
+    } else if (existing == null) {
+      await _db.insertGoal(goal.copyWith(planId: planId));
+    } else {
+      await _db.updateGoal(goal.copyWith(id: existing.id, planId: planId));
+    }
     await reload();
+    return planId;
   }
 
   // 软删除计划
@@ -78,97 +152,47 @@ class AppState extends ChangeNotifier {
     await reload();
   }
 
-  // ============ 目标操作 ============
-
-  // 保存目标（同一计划已存在则更新）
-  Future<void> saveGoal(Goal goal) async {
-    final existing = await _db.getGoalForPlan(goal.planId);
-    if (existing == null) {
-      await _db.insertGoal(goal);
-    } else {
-      await _db.updateGoal(goal.copyWith(id: existing.id));
-    }
-    await reload();
-  }
-
-  // 删除某计划的目标
-  Future<void> removeGoal(int planId) async {
-    final existing = await _db.getGoalForPlan(planId);
-    if (existing != null) {
-      await _db.deleteGoal(existing.id!);
-      await reload();
-    }
-  }
-
   // ============ 打卡操作 ============
 
-  // 判断某计划某天是否已打卡
+  // 某计划某天是否有记录（含"纯备注"记录）
   bool hasRecord(int planId, String date) =>
-      _records.any((r) => r.planId == planId && r.date == date);
+      _recordsByDate[date]?.containsKey(planId) ?? false;
+
+  // 某计划某天是否已打卡（纯备注记录 count=0 不算）
+  bool isDone(int planId, String date) =>
+      (_recordsByDate[date]?[planId]?.count ?? 0) > 0;
 
   // 查询某计划某天的记录（可能为 null）
-  Record? recordOf(int planId, String date) {
-    for (final r in _records) {
-      if (r.planId == planId && r.date == date) return r;
-    }
-    return null;
-  }
+  Record? recordOf(int planId, String date) => _recordsByDate[date]?[planId];
 
   // 某计划某天的打卡次数（0 = 未打卡）
   int checkCount(int planId, String date) =>
       recordOf(planId, date)?.count ?? 0;
 
-  // 点按打卡：普通计划 = 打卡/取消切换；开启"每天可多次"的计划 = 次数 +1
+  // 点按打卡：普通计划 = 打卡/取消切换；开启"每天可多次"的计划 = 次数 +1。
+  // 写库在数据库事务内以实际状态为准（连点安全），完成后只同步内存缓存，
+  // 不再全量 reload。
   Future<void> tapCheckIn(Plan plan, String date) async {
-    final existing = recordOf(plan.id!, date);
-    if (existing == null) {
-      await _db.insertRecord(Record(
-        planId: plan.id!,
-        date: date,
-        count: 1,
-        createdAt: nowStamp(),
-      ));
-    } else if (plan.multiPerDay) {
-      // 每天可多次：次数累加
-      await _db.updateRecord(existing.copyWith(count: existing.count + 1));
+    final Record? result;
+    if (plan.multiPerDay) {
+      result = await _db.incrementRecord(plan.id!, date, nowStamp());
     } else {
-      // 普通计划：再点一次取消打卡
-      await _db.deleteRecord(existing.id!);
+      result = await _db.toggleRecord(plan.id!, date, nowStamp());
     }
-    await reload();
+    if (_syncRecord(plan.id!, date, result)) notifyListeners();
   }
 
-  // 减少一次打卡（每天可多次的计划用）；减到 0 时删除记录
+  // 减少一次打卡（每天可多次的计划用）；减到 0 时删除记录，有备注则保留为纯备注
   Future<void> removeOneCheckIn(Plan plan, String date) async {
-    final existing = recordOf(plan.id!, date);
-    if (existing == null) return;
-    if (existing.count <= 1) {
-      await _db.deleteRecord(existing.id!);
-    } else {
-      await _db.updateRecord(existing.copyWith(count: existing.count - 1));
-    }
-    await reload();
+    final result = await _db.decrementRecord(plan.id!, date);
+    if (_syncRecord(plan.id!, date, result)) notifyListeners();
   }
 
-  // 设置备注；该天没有记录且备注为空时不创建空记录
+  // 设置备注；没打卡只写备注 = 生成 count=0 的"纯备注"记录，不计入完成数
+  // 与连续天数。该天没有记录且备注为空时不创建记录。
   Future<void> setNote(int planId, String date, String note) async {
-    final existing = recordOf(planId, date);
-    final trimmed = note.trim();
-    if (existing == null) {
-      if (trimmed.isEmpty) return; // 没打卡也没写内容，不生成记录
-      await _db.insertRecord(Record(
-        planId: planId,
-        date: date,
-        note: trimmed,
-        createdAt: nowStamp(),
-      ));
-    } else {
-      // 只改备注（copyWith 保留 count 等其他字段；空串表示清空备注）
-      await _db.updateRecord(
-        existing.copyWith(note: trimmed.isEmpty ? '' : trimmed),
-      );
-    }
-    await reload();
+    final result = await _db.setNoteRecord(planId, date, note.trim(), nowStamp());
+    if (_syncRecord(planId, date, result)) notifyListeners();
   }
 
   // 当前时间戳 yyyy-MM-dd HH:mm
@@ -182,29 +206,20 @@ class AppState extends ChangeNotifier {
   // ============ 查询 / 统计 ============
 
   // 某计划的目标（可能为 null）
-  Goal? goalOf(int planId) {
-    for (final g in _goals) {
-      if (g.planId == planId) return g;
-    }
-    return null;
-  }
+  Goal? goalOf(int planId) => _goalsByPlan[planId];
 
-  // 某计划已打卡的日期集合
-  Set<String> recordDatesOf(int planId) =>
-      _records.where((r) => r.planId == planId).map((r) => r.date).toSet();
+  // 某计划已打卡（count>0）的日期集合
+  Set<String> recordDatesOf(int planId) => {
+        for (final r in _recordsByPlan[planId] ?? const <Record>[])
+          if (r.count > 0) r.date,
+      };
 
   // 某天的所有打卡记录（日历圆点/明细用）
   List<Record> recordsOn(String date) =>
-      _records.where((r) => r.date == date).toList();
+      _recordsByDate[date]?.values.toList() ?? const [];
 
   // 按 ID 查找计划（找不到返回 null）
-  Plan? planById(int? id) {
-    if (id == null) return null;
-    for (final p in _plans) {
-      if (p.id == id) return p;
-    }
-    return null;
-  }
+  Plan? planById(int? id) => id == null ? null : _plansById[id];
 
   // 某计划从某天往回的连续天数（只统计该计划应打卡的日子）
   int streakDays(Plan plan, {DateTime? anchor}) {
@@ -216,7 +231,7 @@ class AppState extends ChangeNotifier {
     }
     // 逐天往前数，遇到未打卡的应打卡日即停
     while (plan.shouldCheckIn(day) &&
-        hasRecord(plan.id!, DateUtils.toKey(day))) {
+        isDone(plan.id!, DateUtils.toKey(day))) {
       count++;
       day = DateUtils.addDays(day, -1);
     }
@@ -224,9 +239,13 @@ class AppState extends ChangeNotifier {
   }
 
   // 某计划总打卡次数（含一天多次的累计）
-  int totalCount(int planId) => _records
-      .where((r) => r.planId == planId)
-      .fold(0, (sum, r) => sum + r.count);
+  int totalCount(int planId) {
+    var sum = 0;
+    for (final r in _recordsByPlan[planId] ?? const <Record>[]) {
+      sum += r.count;
+    }
+    return sum;
+  }
 
   // 目标在某周期内的实际完成数量（anchor 为该周期内任意一天）
   // 按天计 = 区间内有记录的天数；按次计 = 打卡次数累计
@@ -393,9 +412,8 @@ class AppState extends ChangeNotifier {
     final startKey = DateUtils.toKey(start);
     final endKey = DateUtils.toKey(end);
     var c = 0;
-    for (final r in _records) {
-      if (r.planId == plan.id &&
-          r.date.compareTo(startKey) >= 0 &&
+    for (final r in _recordsByPlan[plan.id] ?? const <Record>[]) {
+      if (r.date.compareTo(startKey) >= 0 &&
           r.date.compareTo(endKey) <= 0) {
         c += r.count;
       }
@@ -403,18 +421,19 @@ class AppState extends ChangeNotifier {
     return c;
   }
 
-  // 某计划在区间内的打卡天数（一天多次也算一天）
+  // 某计划在区间内的打卡天数（一天多次也算一天；纯备注不算）
   int daysInRange(Plan plan, DateTime start, DateTime end) {
     final startKey = DateUtils.toKey(start);
     final endKey = DateUtils.toKey(end);
-    return _records
-        .where((r) =>
-            r.planId == plan.id &&
-            r.date.compareTo(startKey) >= 0 &&
-            r.date.compareTo(endKey) <= 0)
-        .map((r) => r.date)
-        .toSet()
-        .length;
+    final dates = <String>{};
+    for (final r in _recordsByPlan[plan.id] ?? const <Record>[]) {
+      if (r.count > 0 &&
+          r.date.compareTo(startKey) >= 0 &&
+          r.date.compareTo(endKey) <= 0) {
+        dates.add(r.date);
+      }
+    }
+    return dates.length;
   }
 
   // ============ 导入 / 导出 ============
@@ -442,65 +461,77 @@ class AppState extends ChangeNotifier {
   }
 
   // 从 JSON 字符串导入；merge=true 合并（跳过重复），false 覆盖（清空后导入）。
-  // 返回导入摘要文字。
+  // 解析阶段逐条校验，损坏/非法的数据跳过而不是让整个导入失败或污染后续页面；
+  // 实际写入在数据库单事务内完成（原子性）。返回导入摘要文字。
   Future<String> importFromJson(String raw, {required bool merge}) async {
     final dynamic decoded = jsonDecode(raw);
     if (decoded is! Map<String, dynamic> || !decoded.containsKey('plans')) {
       throw const FormatException('不是有效的打卡备份文件');
     }
-    final plans = [
-      for (final item in decoded['plans'] as List? ?? [])
-        Plan.fromMap(item as Map<String, Object?>),
-    ];
-    final goals = [
-      for (final item in decoded['goals'] as List? ?? [])
-        Goal.fromMap(item as Map<String, Object?>),
-    ];
-    final records = [
-      for (final item in decoded['records'] as List? ?? [])
-        Record.fromMap(item as Map<String, Object?>),
-    ];
 
-    // 覆盖模式先清空现有数据
-    if (!merge) {
-      await _db.clearAll();
+    var skipped = 0;
+    bool isValidDate(String s) {
+      try {
+        DateUtils.parse(s);
+        return true;
+      } catch (_) {
+        return false;
+      }
     }
 
-    var planCount = 0;
-    for (final p in plans) {
-      if (p.id == null) continue;
-      if (merge && await _db.planExists(p.id!)) continue;
-      await _db.insertPlan(p);
-      planCount++;
+    final plans = <Plan>[];
+    for (final item in decoded['plans'] as List? ?? []) {
+      try {
+        final p = Plan.fromMap(item as Map<String, Object?>);
+        if (p.id == null) {
+          skipped++;
+          continue;
+        }
+        // repeatDays 只保留 1~7，避免脏数据导致展示"周几"时越界
+        plans.add(p.copyWith(
+          repeatDays: [for (final d in p.repeatDays) if (d >= 1 && d <= 7) d],
+        ));
+      } catch (_) {
+        skipped++;
+      }
     }
-    var goalCount = 0;
-    for (final g in goals) {
-      if (merge && await _db.goalExistsForPlan(g.planId)) continue;
-      // 不带 id 插入，由数据库自增分配，避免与现有数据主键冲突
-      await _db.insertGoal(Goal(
-        planId: g.planId,
-        type: g.type,
-        period: g.period,
-        totalTimes: g.totalTimes,
-        deadlineDate: g.deadlineDate,
-        startDate: g.startDate,
-        unit: g.unit,
-      ));
-      goalCount++;
+
+    final goals = <Goal>[];
+    for (final item in decoded['goals'] as List? ?? []) {
+      try {
+        final g = Goal.fromMap(item as Map<String, Object?>);
+        if (g.totalTimes < 0 ||
+            (g.deadlineDate != null && !isValidDate(g.deadlineDate!))) {
+          skipped++;
+          continue;
+        }
+        goals.add(g);
+      } catch (_) {
+        skipped++;
+      }
     }
-    var recordCount = 0;
-    for (final r in records) {
-      // 同计划同日期只保留一条，合并时自动去重；id 由自增分配
-      final fresh = Record(
-        planId: r.planId,
-        date: r.date,
-        note: r.note,
-        count: r.count,
-        createdAt: r.createdAt,
-      );
-      if (await _db.insertRecordIfAbsent(fresh) != null) recordCount++;
+
+    final records = <Record>[];
+    for (final item in decoded['records'] as List? ?? []) {
+      try {
+        final r = Record.fromMap(item as Map<String, Object?>);
+        // 日期必须合法（统计/日历按日期解析），次数不能为负；count=0 是纯备注记录
+        if (r.count < 0 || !isValidDate(r.date)) {
+          skipped++;
+          continue;
+        }
+        records.add(r);
+      } catch (_) {
+        skipped++;
+      }
     }
+
+    final (planCount, goalCount, recordCount, orphanCount) =
+        await _db.importAll(
+            plans: plans, goals: goals, records: records, merge: merge);
+    skipped += orphanCount;
     await reload();
-    return '计划 $planCount 个、目标 $goalCount 个、记录 $recordCount 条';
+    final base = '计划 $planCount 个、目标 $goalCount 个、记录 $recordCount 条';
+    return skipped > 0 ? '$base（跳过无效数据 $skipped 条）' : base;
   }
 }

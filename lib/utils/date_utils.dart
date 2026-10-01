@@ -17,13 +17,6 @@ class DateUtils {
   // 把日期加减 n 天，返回新 DateTime
   static DateTime addDays(DateTime d, int n) => d.add(Duration(days: n));
 
-  // 某天是星期几（ISO：周一=1..周日=7）
-  static int weekday(DateTime d) => d.weekday;
-
-  // 某天是否在给定星期集合中（weekdays 存 1..7）
-  static bool inWeekdays(DateTime d, Set<int> weekdays) =>
-      weekdays.contains(d.weekday);
-
   // 把普通日期时间戳转成仅日期部分（当天 00:00），用于比较
   static DateTime dateOnly(DateTime d) =>
       DateTime(d.year, d.month, d.day);
